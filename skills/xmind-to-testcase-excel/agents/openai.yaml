@@ -1,0 +1,4 @@
+interface:
+  display_name: "XMind 测试用例 Excel"
+  short_description: "读取 XMind 并生成结构化 Excel 测试用例"
+  default_prompt: "使用 $xmind-to-testcase-excel 将这个 XMind 导图转换为 Excel 测试用例。"
