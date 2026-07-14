@@ -78,6 +78,54 @@ def load_manifest(path: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
     return chunks, order
 
 
+def load_packets(path: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    chunks, chunk_order = load_manifest(path)
+    payload = load_json(path)
+    raw_packets = payload.get("packets") if isinstance(payload, dict) else None
+    if raw_packets is None:
+        packets = {
+            f"packet-{index:04d}": {
+                "id": f"packet-{index:04d}",
+                "file": chunks[chunk_id]["file"],
+                "chunk_ids": [chunk_id],
+            }
+            for index, chunk_id in enumerate(chunk_order, start=1)
+        }
+        return packets, list(packets)
+    if not isinstance(raw_packets, list) or not raw_packets:
+        raise CaseValidationError("manifest.packets 必须是非空数组")
+
+    packets: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    flattened: list[str] = []
+    for index, raw in enumerate(raw_packets, start=1):
+        if not isinstance(raw, dict):
+            raise CaseValidationError(f"manifest 第 {index} 个 Packet 不是对象")
+        packet_id = raw.get("id")
+        if not isinstance(packet_id, str) or not re.fullmatch(r"packet-\d{4}", packet_id):
+            raise CaseValidationError(f"manifest 第 {index} 个 Packet id 无效")
+        if packet_id in packets:
+            raise CaseValidationError(f"manifest 中存在重复 Packet：{packet_id}")
+        if not isinstance(raw.get("file"), str) or not raw["file"]:
+            raise CaseValidationError(f"{packet_id} 缺少 file")
+        chunk_ids = raw.get("chunk_ids")
+        if not isinstance(chunk_ids, list) or not chunk_ids:
+            raise CaseValidationError(f"{packet_id}.chunk_ids 必须是非空数组")
+        if not all(isinstance(chunk_id, str) and chunk_id in chunks for chunk_id in chunk_ids):
+            raise CaseValidationError(f"{packet_id} 包含未知 chunk_id")
+        if len(chunk_ids) != len(set(chunk_ids)):
+            raise CaseValidationError(f"{packet_id} 包含重复 chunk_id")
+        normalized = dict(raw)
+        normalized["chunk_ids"] = list(chunk_ids)
+        packets[packet_id] = normalized
+        order.append(packet_id)
+        flattened.extend(chunk_ids)
+
+    if flattened != chunk_order:
+        raise CaseValidationError("manifest.packets 必须按顺序且不重不漏地覆盖全部分块")
+    return packets, order
+
+
 def _source_markdown(manifest_path: Path, chunk: dict[str, Any]) -> str:
     base = manifest_path.parent.resolve()
     source = (base / chunk["file"]).resolve()
@@ -163,6 +211,81 @@ def validate_file(
     return validate_result(payload, columns, chunk, _source_markdown(manifest_path, chunk))
 
 
+def validate_packet_result(
+    payload: Any,
+    columns: list[str],
+    chunks: dict[str, dict[str, Any]],
+    packet: dict[str, Any],
+    manifest_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {"packet_id", "chunk_results"}:
+        raise CaseValidationError("Packet JSON 顶层必须且只能包含 packet_id 和 chunk_results")
+    if payload["packet_id"] != packet["id"]:
+        raise CaseValidationError(
+            f"packet_id 不匹配：期望 {packet['id']}，实际 {payload['packet_id']!r}"
+        )
+    raw_results = payload["chunk_results"]
+    if not isinstance(raw_results, list) or not raw_results:
+        raise CaseValidationError(f"{packet['id']} 的 chunk_results 必须是非空数组")
+
+    actual_ids: list[str] = []
+    for index, raw_result in enumerate(raw_results, start=1):
+        if not isinstance(raw_result, dict):
+            raise CaseValidationError(f"{packet['id']} 第 {index} 个 chunk_result 不是对象")
+        chunk_id = raw_result.get("chunk_id")
+        if not isinstance(chunk_id, str):
+            raise CaseValidationError(f"{packet['id']} 第 {index} 个 chunk_result 缺少 chunk_id")
+        actual_ids.append(chunk_id)
+
+    expected_ids = packet["chunk_ids"]
+    duplicates = sorted({chunk_id for chunk_id in actual_ids if actual_ids.count(chunk_id) > 1})
+    missing = [chunk_id for chunk_id in expected_ids if chunk_id not in actual_ids]
+    extra = [chunk_id for chunk_id in actual_ids if chunk_id not in expected_ids]
+    if duplicates:
+        raise CaseValidationError(f"{packet['id']} 包含重复分块结果：{', '.join(duplicates)}")
+    if missing or extra:
+        raise CaseValidationError(
+            f"{packet['id']} 分块结果不完整；缺少={missing}，多出={extra}"
+        )
+    if actual_ids != expected_ids:
+        raise CaseValidationError(f"{packet['id']} 的 chunk_results 顺序必须与 Packet 一致")
+
+    normalized: list[dict[str, Any]] = []
+    for raw_result, chunk_id in zip(raw_results, expected_ids):
+        chunk = chunks[chunk_id]
+        normalized.append(
+            validate_result(
+                raw_result,
+                columns,
+                chunk,
+                _source_markdown(manifest_path, chunk),
+            )
+        )
+    return {"packet_id": packet["id"], "chunk_results": normalized}
+
+
+def validate_packet_file(
+    input_path: Path,
+    manifest_path: Path,
+    schema_path: Path,
+    expected_packet_id: str | None = None,
+) -> dict[str, Any]:
+    columns = load_schema(schema_path)
+    chunks, _ = load_manifest(manifest_path)
+    packets, _ = load_packets(manifest_path)
+    payload = load_json(input_path)
+    if not isinstance(payload, dict):
+        raise CaseValidationError("Packet JSON 顶层必须是对象")
+    packet_id = payload.get("packet_id")
+    if not isinstance(packet_id, str) or packet_id not in packets:
+        raise CaseValidationError(f"Packet JSON 包含未知 packet_id：{packet_id!r}")
+    if expected_packet_id is not None and packet_id != expected_packet_id:
+        raise CaseValidationError(
+            f"当前应生成 {expected_packet_id}，实际收到 {packet_id}"
+        )
+    return validate_packet_result(payload, columns, chunks, packets[packet_id], manifest_path)
+
+
 def merge_files(
     manifest_path: Path,
     schema_path: Path,
@@ -174,22 +297,40 @@ def merge_files(
         raise CaseValidationError(f"用例目录不存在：{cases_dir}")
 
     results: dict[str, dict[str, Any]] = {}
+    packets, _ = load_packets(manifest_path)
     for path in sorted(cases_dir.glob("*.json")):
         payload = load_json(path)
         if not isinstance(payload, dict):
             raise CaseValidationError(f"{path} 顶层必须是对象")
-        chunk_id = payload.get("chunk_id")
-        if not isinstance(chunk_id, str) or chunk_id not in chunks:
-            raise CaseValidationError(f"{path} 包含未知 chunk_id：{chunk_id!r}")
-        if chunk_id in results:
-            raise CaseValidationError(f"存在多个 {chunk_id} 结果文件")
-        chunk = chunks[chunk_id]
-        results[chunk_id] = validate_result(
-            payload,
-            columns,
-            chunk,
-            _source_markdown(manifest_path, chunk),
-        )
+        if "packet_id" in payload:
+            packet_id = payload.get("packet_id")
+            if not isinstance(packet_id, str) or packet_id not in packets:
+                raise CaseValidationError(f"{path} 包含未知 packet_id：{packet_id!r}")
+            packet_result = validate_packet_result(
+                payload,
+                columns,
+                chunks,
+                packets[packet_id],
+                manifest_path,
+            )
+            for chunk_result in packet_result["chunk_results"]:
+                chunk_id = chunk_result["chunk_id"]
+                if chunk_id in results:
+                    raise CaseValidationError(f"存在多个 {chunk_id} 结果文件")
+                results[chunk_id] = chunk_result
+        else:
+            chunk_id = payload.get("chunk_id")
+            if not isinstance(chunk_id, str) or chunk_id not in chunks:
+                raise CaseValidationError(f"{path} 包含未知 chunk_id：{chunk_id!r}")
+            if chunk_id in results:
+                raise CaseValidationError(f"存在多个 {chunk_id} 结果文件")
+            chunk = chunks[chunk_id]
+            results[chunk_id] = validate_result(
+                payload,
+                columns,
+                chunk,
+                _source_markdown(manifest_path, chunk),
+            )
 
     missing = [chunk_id for chunk_id in order if chunk_id not in results]
     if missing:
@@ -235,6 +376,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     validate.add_argument("--schema", type=Path, required=True)
     validate.add_argument("--input", type=Path, required=True)
 
+    validate_packet = subparsers.add_parser("validate-packet", help="校验一个 Packet 结果")
+    validate_packet.add_argument("--manifest", type=Path, required=True)
+    validate_packet.add_argument("--schema", type=Path, required=True)
+    validate_packet.add_argument("--input", type=Path, required=True)
+
     merge = subparsers.add_parser("merge", help="校验并合并全部分块结果")
     merge.add_argument("--manifest", type=Path, required=True)
     merge.add_argument("--schema", type=Path, required=True)
@@ -251,6 +397,22 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     {"chunk_id": result["chunk_id"], "case_count": len(result["test_cases"]), "valid": True},
+                    ensure_ascii=False,
+                )
+            )
+        elif args.command == "validate-packet":
+            result = validate_packet_file(args.input, args.manifest, args.schema)
+            print(
+                json.dumps(
+                    {
+                        "packet_id": result["packet_id"],
+                        "chunk_count": len(result["chunk_results"]),
+                        "case_count": sum(
+                            len(chunk_result["test_cases"])
+                            for chunk_result in result["chunk_results"]
+                        ),
+                        "valid": True,
+                    },
                     ensure_ascii=False,
                 )
             )

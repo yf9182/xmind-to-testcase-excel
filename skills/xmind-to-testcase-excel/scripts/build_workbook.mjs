@@ -17,7 +17,7 @@ function parseArgs(argv) {
       values.overwrite = true;
       continue;
     }
-    if (!["--input", "--output", "--preview"].includes(token)) {
+    if (!["--input", "--output", "--preview", "--report"].includes(token)) {
       throw new Error(`未知参数：${token}`);
     }
     const value = argv[index + 1];
@@ -39,6 +39,39 @@ function parseArgs(argv) {
     throw new Error("--preview 必须使用 .png 扩展名");
   }
   return values;
+}
+
+function ndjsonRecords(ndjson) {
+  return ndjson
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { raw: line };
+      }
+    });
+}
+
+function containsFormulaError(value, key = "") {
+  const ignoredKeys = new Set(["searchTerm", "summary", "query"]);
+  if (ignoredKeys.has(key)) {
+    return false;
+  }
+  if (typeof value === "string") {
+    return ["#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A"].some((token) =>
+      value.includes(token),
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsFormulaError(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).some(([childKey, child]) => containsFormulaError(child, childKey));
+  }
+  return false;
 }
 
 async function exists(filePath) {
@@ -260,6 +293,11 @@ async function main() {
     options: { useRegex: true, maxResults: 100 },
     summary: "final formula error scan",
   });
+  const inspectionRecords = ndjsonRecords(inspection.ndjson);
+  const formulaErrorRecords = ndjsonRecords(formulaErrors.ndjson);
+  const formulaErrorCount = formulaErrorRecords.filter((record) =>
+    containsFormulaError(record),
+  ).length;
 
   const previewRows = Math.min(rowCount, 25);
   const preview = await workbook.render({
@@ -273,15 +311,33 @@ async function main() {
   const output = await SpreadsheetFile.exportXlsx(workbook);
   await output.save(outputPath);
 
-  console.log(JSON.stringify({
+  const summary = {
     output: outputPath,
     preview: previewPath,
     sheet: "测试用例",
     column_count: columnCount,
     case_count: testCases.length,
-    inspection: inspection.ndjson,
-    formula_errors: formulaErrors.ndjson,
-  }));
+    inspection_record_count: inspectionRecords.length,
+    formula_error_count: formulaErrorCount,
+  };
+  if (args.report) {
+    const reportPath = path.resolve(args.report);
+    await fs.mkdir(path.dirname(reportPath), { recursive: true });
+    await fs.writeFile(
+      reportPath,
+      `${JSON.stringify({
+        ...summary,
+        inspection: inspection.ndjson,
+        formula_errors: formulaErrors.ndjson,
+      }, null, 2)}\n`,
+      "utf8",
+    );
+    summary.report = reportPath;
+  } else {
+    summary.inspection = inspection.ndjson;
+    summary.formula_errors = formulaErrors.ndjson;
+  }
+  console.log(JSON.stringify(summary));
 }
 
 main().catch((error) => {
